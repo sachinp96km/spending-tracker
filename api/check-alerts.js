@@ -24,7 +24,6 @@ module.exports = async (req, res) => {
   }
 
   try {
-    // Read from spendwise_alerts collection (no auth needed)
     const snap = await db.collection('spendwise_alerts').get();
     const results = [];
     const today = getISTToday();
@@ -36,72 +35,119 @@ module.exports = async (req, res) => {
       const tgChatId = data.tgChatId;
       if (!tgToken || !tgChatId) continue;
 
+      // Load already fired alerts log
+      const firedRef = db.collection('spendwise_fired').doc(doc.id);
+      const firedSnap = await firedRef.get();
+      const fired = firedSnap.exists ? (firedSnap.data().keys || []) : [];
+
       let reminders = [];
       let planner = [];
       try { reminders = JSON.parse(data.reminders || '[]'); } catch(e) {}
       try { planner = JSON.parse(data.planner || '[]'); } catch(e) {}
 
+      const newFired = [...fired];
+
       for (const r of reminders) {
-        if (!r.date) continue;
+        if (!r.date || !r.id) continue;
         const daysLeft = daysDiff(r.date, today);
 
-        // Custom time alert — check if today matches AND time is within 30 min window
+        // CUSTOM TIME ALERT — fires ONCE at exact time (within 30 min window)
         if (r.customAlertOn && r.alertDate) {
           const alertDate = (r.alertDate||'').trim().slice(0,10);
-          if (alertDate === today) {
+          const fireKey = `custom_${r.id}_${alertDate}`;
+          if (alertDate === today && !fired.includes(fireKey)) {
             const { hh, mm } = parseTime(r.alertTime || '09:00');
             const alertMins = hh * 60 + mm;
             const nowMins = nowIST.hh * 60 + nowIST.mm;
-            // Fire if within 30 minute window
             if (nowMins >= alertMins && nowMins < alertMins + 30) {
               await sendTelegram(tgToken, tgChatId,
-                `🔔 <b>SpendWise Alert</b>\n\n📌 <b>${r.title}</b>\n💰 Amount: <b>₹${fmt(r.amount)}</b>\n📅 Due: ${formatDate(r.date)}\n🕐 Scheduled at: ${r.alertTime}`
+                `🔔 <b>SpendWise Custom Alert</b>
+
+📌 <b>${r.title}</b>
+💰 Amount: <b>₹${fmt(r.amount)}</b>
+📅 Due: ${formatDate(r.date)}
+🕐 Scheduled: ${r.alertTime}`
               );
+              newFired.push(fireKey);
               results.push({ type: 'custom', title: r.title });
             }
           }
         }
 
-        // Auto advance — 2 days before
+        // 2 DAYS BEFORE — fires ONCE
         if (r.autoAlert !== false) {
-          if (addDays(r.date, -2) === today) {
+          const twoDayKey = `2day_${r.id}_${today}`;
+          if (addDays(r.date, -2) === today && !fired.includes(twoDayKey)) {
             await sendTelegram(tgToken, tgChatId,
-              `⏰ <b>SpendWise — Due in 2 Days!</b>\n\n📌 <b>${r.title}</b>\n💰 Amount: <b>₹${fmt(r.amount)}</b>\n📅 Due on: ${formatDate(r.date)}`
+              `⏰ <b>SpendWise — Due in 2 Days!</b>
+
+📌 <b>${r.title}</b>
+💰 Amount: <b>₹${fmt(r.amount)}</b>
+📅 Due on: ${formatDate(r.date)}`
             );
+            newFired.push(twoDayKey);
             results.push({ type: '2day', title: r.title });
           }
-          // Due today
-          if (r.date === today) {
+
+          // DUE TODAY — fires ONCE
+          const todayKey = `today_${r.id}_${today}`;
+          if (r.date === today && !fired.includes(todayKey)) {
             await sendTelegram(tgToken, tgChatId,
-              `🔴 <b>SpendWise — Due TODAY!</b>\n\n📌 <b>${r.title}</b>\n💰 Amount: <b>₹${fmt(r.amount)}</b>\n📅 Pay today!`
+              `🔴 <b>SpendWise — Due TODAY!</b>
+
+📌 <b>${r.title}</b>
+💰 Amount: <b>₹${fmt(r.amount)}</b>
+📅 Please pay today!`
             );
+            newFired.push(todayKey);
             results.push({ type: 'today', title: r.title });
           }
         }
 
-        // Overdue
-        if (daysLeft < 0) {
-          // Only send overdue once per day (morning ping)
-          const nowH = nowIST.hh;
-          if (nowH >= 8 && nowH < 9) { // only during 8-9 AM IST
+        // OVERDUE — fires ONCE per day at morning (8-9 AM IST only)
+        if (daysLeft < 0 && nowIST.hh >= 8 && nowIST.hh < 9) {
+          const overdueKey = `overdue_${r.id}_${today}`;
+          if (!fired.includes(overdueKey)) {
             await sendTelegram(tgToken, tgChatId,
-              `⚠️ <b>SpendWise — OVERDUE!</b>\n\n📌 <b>${r.title}</b>\n💰 Amount: <b>₹${fmt(r.amount)}</b>\n🔴 Overdue by <b>${Math.abs(daysLeft)} days</b>`
+              `⚠️ <b>SpendWise — OVERDUE!</b>
+
+📌 <b>${r.title}</b>
+💰 Amount: <b>₹${fmt(r.amount)}</b>
+🔴 Overdue by <b>${Math.abs(daysLeft)} day${Math.abs(daysLeft)>1?'s':''}</b>`
             );
+            newFired.push(overdueKey);
             results.push({ type: 'overdue', title: r.title });
           }
         }
       }
 
-      // Planner dues
+      // PLANNER — fires ONCE
       for (const p of planner) {
-        if (p.paid || !p.dueDate) continue;
+        if (p.paid || !p.dueDate || !p.id) continue;
         const daysLeft = daysDiff(p.dueDate, today);
-        if (daysLeft === 2) {
+        const planKey = `planner_${p.id}_${today}`;
+        if ((daysLeft === 2 || daysLeft === 0) && !fired.includes(planKey)) {
           await sendTelegram(tgToken, tgChatId,
-            `📅 <b>SpendWise — Planned Payment in 2 Days</b>\n\n📌 <b>${p.desc}</b>\n💰 Amount: <b>₹${fmt(p.amount)}</b>\n📅 Due: ${formatDate(p.dueDate)}`
+            `📅 <b>SpendWise — Planned Payment ${daysLeft===0?'TODAY':'in 2 Days'}</b>
+
+📌 <b>${p.desc}</b>
+💰 Amount: <b>₹${fmt(p.amount)}</b>
+📅 Due: ${formatDate(p.dueDate)}`
           );
+          newFired.push(planKey);
           results.push({ type: 'planner', title: p.desc });
         }
+      }
+
+      // Save fired log — clean old keys (keep only last 7 days)
+      if (newFired.length > fired.length) {
+        const cleanFired = newFired.filter(k => {
+          const parts = k.split('_');
+          const dateStr = parts[parts.length-1];
+          if (!dateStr.match(/^\d{4}-\d{2}-\d{2}$/)) return true;
+          return daysDiff(today, dateStr) <= 7;
+        });
+        await firedRef.set({ keys: cleanFired, updatedAt: new Date().toISOString() });
       }
     }
 
